@@ -2,8 +2,8 @@
 
 import os
 
-if "PYOPENGL_PLATFORM" not in os.environ:
-    os.environ["PYOPENGL_PLATFORM"] = "egl"
+# if "PYOPENGL_PLATFORM" not in os.environ:
+#     os.environ["PYOPENGL_PLATFORM"] = "egl"
 from typing import List, Optional
 
 import cv2
