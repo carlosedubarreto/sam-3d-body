@@ -2,6 +2,7 @@
 import argparse
 import os
 from glob import glob
+import pickle
 
 import pyrootutils
 
@@ -19,6 +20,56 @@ from sam_3d_body import load_sam_3d_body, SAM3DBodyEstimator
 from tools.vis_utils import visualize_sample, visualize_sample_together
 from tqdm import tqdm
 
+import pandas as pd
+import pyarrow, fastparquet
+
+#### Inicio
+## Retirado do pkl2parquet que foi criado com ajuda do Cluade e Gemini, para converter PKL que adicionei como extracao do SAM 3d Body
+# importante a geracao do parquet pois é o dado utilizado no SOMA-X para converter do MHR para SOMA-x
+# ---------------------------------------------------------------------------
+# PKL layout constants
+# ---------------------------------------------------------------------------
+SCALE_PARAMS_IN_PKL = 28   # stored in PKL (first N of the 68 MHR expects)
+SCALE_PARAMS_TOTAL  = 68   # MHR model_params[136:204]
+BODY_POSE_STORED    = 133  # body_pose_params in PKL
+BODY_POSE_USED      = 130  # drop last 3 (flexible bone-length, typically 0)
+MODEL_PARAMS_DIM    = 204  # total expected by mhr2soma
+
+
+def frame_to_mhr_params(frame: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Convert one SAM 3D Body PKL frame to (shape_params, model_params).
+
+    Returns
+    -------
+    shape_params : (45,) float32
+    model_params : (204,) float32  layout matches mhr2soma expectations
+    """
+    shape_params = frame["shape_params"].astype(np.float32)           # (45,)
+
+    # --- pack model_params (204) ---
+    # [0:3] global translation: pred_cam_t is in metres, MHR expects centimetres
+    translation_cm = (frame["pred_cam_t"] * 100.0).astype(np.float32) # (3,)
+
+    # [3:6] global orientation (axis-angle, radians)
+    global_rot = frame["global_rot"].astype(np.float32)               # (3,)
+
+    # [6:136] body joint rotations: 130 values (drop last 3 flex-bone params)
+    body_pose = frame["body_pose_params"][:BODY_POSE_USED].astype(np.float32)  # (130,)
+
+    # [136:204] scale params: zero-pad from 28 → 68
+    scale_full = np.zeros(SCALE_PARAMS_TOTAL, dtype=np.float32)
+    scale_full[:SCALE_PARAMS_IN_PKL] = frame["scale_params"].astype(np.float32)
+
+    model_params = np.concatenate(
+        [translation_cm, global_rot, body_pose, scale_full]
+    )  # (3 + 3 + 130 + 68) = 204
+
+    assert model_params.shape == (MODEL_PARAMS_DIM,), (
+        f"model_params shape {model_params.shape} != ({MODEL_PARAMS_DIM},)"
+    )
+    return shape_params, model_params
+
+###### Fim
 
 def main(args):
     if args.output_folder == "":
@@ -90,6 +141,50 @@ def main(args):
             bbox_thr=args.bbox_thresh,
             use_mask=args.use_mask,
         )
+
+        #save parameters
+        pickle_file = f"{output_folder}/{os.path.basename(image_path)[:-4]}.pkl"
+        with open(pickle_file, "wb") as f:
+            pickle.dump(outputs, f)
+
+        #### Inicio
+        #### Salvando o Parquet
+        parquet_path = f"{output_folder}/{os.path.basename(image_path)[:-4]}.parquet"
+
+        rows = []
+        skipped = 0
+        for i, frame in enumerate(outputs):
+            # # Basic sanity check
+            # missing = [k for k in ("shape_params", "pred_cam_t", "global_rot",
+            #                     "body_pose_params", "scale_params") if k not in frame]
+            # if missing:
+            #     if skip_invalid:
+            #         print(f"  Frame {i}: skipping — missing keys: {missing}")
+            #         skipped += 1
+            #         continue
+            #     raise KeyError(f"Frame {i} missing required keys: {missing}")
+
+            shape_p, model_p = frame_to_mhr_params(frame)
+            rows.append({
+                "shape_params": shape_p,
+                "model_params": model_p,
+                "mhr_valid":    True,
+                # "dataset":      str(pkl_path.stem),
+                "image":        str(i),
+            })
+
+        if not rows:
+            raise RuntimeError("No valid frames found in the PKL file.")
+
+        df = pd.DataFrame(rows)
+        # parquet_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(parquet_path, index=False)
+
+        print(f"Wrote {len(rows)} frames → {parquet_path}")
+        if skipped:
+            print(f"  ({skipped} frames skipped due to missing keys)")
+        ###### Fim
+        ###########################
 
         img = cv2.imread(image_path)
         rend_img = visualize_sample_together(img, outputs, estimator.faces)
